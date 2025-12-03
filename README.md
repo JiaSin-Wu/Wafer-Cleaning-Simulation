@@ -14,7 +14,7 @@ Run CPU version first then rename the outputs directory to ans
 # Executioin time
 
 |Version| CPU|GPU0|GPU1|
-|----|---|---|
+|----|---|---|---|
 |seconds|359|35.5||
 
 
