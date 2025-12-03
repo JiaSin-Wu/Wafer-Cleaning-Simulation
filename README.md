@@ -4,6 +4,7 @@ Taiwania2
 # Execution
 
 CPU serial version: `bash run_cpu.sh`
+
 GPU parallel verison `bash run_gpu.sh`
 
 - Remember to do `module load cuda first`
