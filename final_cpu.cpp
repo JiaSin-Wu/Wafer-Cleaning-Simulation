@@ -5,6 +5,7 @@ using namespace std;
 #include <sstream>
 #include <unordered_set>
 
+// --- CSV 讀取功能 ---
 bool load_csv(const string &path, vector<vector<int>> &A) {
   ifstream f(path);
   if (!f)
@@ -43,6 +44,60 @@ vector<vector<int>> build_matrix(double width_cm, double height_cm,
   return vector<vector<int>>(H, vector<int>(W, 0));
 }
 
+// --- RMS 計算功能 (新增) ---
+// 計算圓形區域內的 RMS Deviation (標準差)
+double calculate_rms_deviation_circle(const vector<vector<int>> &data,
+                                      double wafer_rad, double resolution_cm) {
+  if (data.empty())
+    return 0.0;
+  int H = data.size();
+  int W = data[0].size();
+
+  // 計算圓心座標 (以 index 為單位)
+  double center_x = wafer_rad / resolution_cm;
+  double center_y = wafer_rad / resolution_cm;
+  // 計算半徑平方 (以 index 為單位)
+  double radius = wafer_rad / resolution_cm;
+  double radius_sq = radius * radius;
+
+  long long sum = 0;
+  int count = 0;
+
+  // 第一遍：計算平均值 (只計算圓內的點)
+  for (int j = 0; j < H; ++j) {
+    for (int i = 0; i < W; ++i) {
+      double dx = i - center_x;
+      double dy = j - center_y;
+      // 判斷是否在圓內
+      if (dx * dx + dy * dy <= radius_sq) {
+        sum += data[j][i];
+        count++;
+      }
+    }
+  }
+
+  if (count == 0)
+    return 0.0;
+  double mean = (double)sum / count;
+
+  // 第二遍：計算變異數 (Variance)
+  double sq_diff_sum = 0.0;
+  for (int j = 0; j < H; ++j) {
+    for (int i = 0; i < W; ++i) {
+      double dx = i - center_x;
+      double dy = j - center_y;
+      if (dx * dx + dy * dy <= radius_sq) {
+        double diff = data[j][i] - mean;
+        sq_diff_sum += diff * diff;
+      }
+    }
+  }
+
+  // 回傳標準差 (RMS Deviation)
+  return sqrt(sq_diff_sum / count);
+}
+
+// --- 模擬核心功能 ---
 using Point = pair<int, int>;
 struct PointHash {
   size_t operator()(const Point &p) const {
@@ -84,7 +139,9 @@ vector<vector<int>> Cleaning(double Wafew_rad, double wafer_resolution_cm,
       if (visited_this_round.count(loc))
         continue;
 
-      int B_index = (int)llround((r + Wafew_rad) / (2.0 * Wafew_rad) *
+      double brush_length_cm = 40.0;
+      double brush_radius = brush_length_cm / 2.0;
+      int B_index = (int)llround((r + brush_radius) / brush_length_cm *
                                  (int)brush_row.size());
       if (B_index < 0)
         B_index = 0;
@@ -98,8 +155,8 @@ vector<vector<int>> Cleaning(double Wafew_rad, double wafer_resolution_cm,
   return wafer;
 }
 
+// --- PNG 儲存功能 ---
 vector<uint8_t> make_png_gray8(int W, int H, const vector<uint8_t> &img);
-void save_png(const string &path, const vector<vector<int>> &A);
 
 vector<uint8_t> make_png_gray8(int W, int H, const vector<uint8_t> &img) {
   vector<uint8_t> raw;
@@ -200,7 +257,6 @@ void save_png(const string &path, const vector<vector<int>> &A) {
     for (int i = 0; i < W; ++i) {
       float scaled = sqrt(A[j][i] / float(maxv)); // √加強暗處
       img[j * W + i] = 255 - uint8_t(255.0 * scaled);
-      // img[j * W + i] = 255 - uint8_t(255.0 * A[j][i] / maxv); // 白底黑點
     }
   }
   vector<uint8_t> png = make_png_gray8(W, H, img);
@@ -220,24 +276,14 @@ void save_csv(const string &path, const vector<vector<int>> &A) {
   }
 }
 
-string build_filename(double Wafew_rad, double wafer_rotation,
-                      double brush_rotation) {
-  stringstream ss;
-  ss << "clean_waf" << int(Wafew_rad) << "_r" << int(wafer_rotation) << "_b"
-     << int(brush_rotation) << ".png";
-  return ss.str();
-}
-
+// --- Main 程式 ---
 int main(int argc, char **argv) {
   auto start_time = std::chrono::high_resolution_clock::now();
 
-  // Setup for random number generation
-  // std::random_device rd;
-  // std::mt19937 gen(rd());
-  unsigned int seed = 42;
-  std::mt19937 gen(seed);
-  std::uniform_real_distribution<> distrib_rotation(
-      30.0, 120.0); // Speeds from 30 to 120 RPM
+  // Wafer Speeds: 5 distinct speeds
+  vector<double> wafer_rpms = {30, 40, 50, 60, 70, 75, 80, 90, 100, 110};
+  // Brush Speeds: 10 distinct speeds
+  vector<double> brush_rpms = {30, 40, 50, 60, 70, 80, 90, 100, 110, 120};
 
   vector<vector<int>> brush_topology;
   if (!load_csv("matrix.csv", brush_topology)) {
@@ -246,45 +292,57 @@ int main(int argc, char **argv) {
   }
 
   // parameter
-  double wafer_resolution_cm = 0.01; // cm
-  double Wafew_rad = 15.0;           // cm
-  double clean_time_sec = 60.0;      // sec
-  double time_resolution = 0.001;    // sec
+  double wafer_resolution_cm = 0.001; // cm
+  double Wafew_rad = 15.0;            // cm
+  double clean_time_sec = 60.0;       // sec
+  double time_resolution = 0.001;     // sec
+                                      //
+  int sim_count = 0;
+  int total_sims = wafer_rpms.size() * brush_rpms.size();
 
-  for (int i = 0; i < 10; ++i) {
-    // cout << "\n--- Running Simulation " << i + 1 << " of 1000 ---" << endl;
-    double wafer_rotation = distrib_rotation(gen);
-    double brush_rotation = distrib_rotation(gen);
-    auto clean_topolog =
-        Cleaning(Wafew_rad, wafer_resolution_cm, wafer_rotation, brush_rotation,
-                 clean_time_sec, time_resolution, brush_topology);
+  for (double wafer_rotation : wafer_rpms) {
+    for (double brush_rotation : brush_rpms) {
 
-    int maxv = 0, nonzero = 0;
-    for (auto &row : clean_topolog)
-      for (int val : row) {
-        if (val > 0)
-          nonzero++;
-        maxv = max(maxv, val);
-      }
-    // cout << "Max value = " << maxv << ", Non-zero points = " << nonzero <<
-    // endl;
+      cout << "=== Simulation " << sim_count << " / " << total_sims
+           << " ===" << endl;
+      cout << "Wafer rotation: " << wafer_rotation
+           << " rpm, Brush rotation: " << brush_rotation << " rpm" << endl;
+      // 1. Cleaning Simulation
+      auto start_clean = std::chrono::high_resolution_clock::now();
+      auto clean_topolog = Cleaning(
+          Wafew_rad, wafer_resolution_cm, wafer_rotation, brush_rotation,
+          clean_time_sec, time_resolution, brush_topology);
+      auto end_clean = std::chrono::high_resolution_clock::now();
+      std::chrono::duration<double, std::milli> elapsed_clean =
+          end_clean - start_clean;
+      cout << "Cleaning Time: " << elapsed_clean.count() << " ms" << endl;
 
-    // New file naming to avoid overwrites
-    stringstream ss_prefix;
-    ss_prefix << "outputs/run_" << setfill('0') << setw(4) << i + 1
-              << "_clean_waf" << int(Wafew_rad) << "_r" << int(wafer_rotation)
-              << "_b" << int(brush_rotation);
-    string name_prefix = ss_prefix.str();
+      // 2. RMS Calculation (Added)
+      auto start_rms = std::chrono::high_resolution_clock::now();
+      double rms_val = calculate_rms_deviation_circle(clean_topolog, Wafew_rad,
+                                                      wafer_resolution_cm);
+      auto end_rms = std::chrono::high_resolution_clock::now();
+      std::chrono::duration<double, std::micro> elapsed_rms =
+          end_rms - start_rms;
 
-    string png_file = name_prefix + ".png";
-    string csv_file = name_prefix + ".csv";
+      cout << "RMS Calculation Time: " << elapsed_rms.count() << " us" << endl;
+      cout << "RMS Deviation: " << rms_val << endl;
 
-    // save_png(png_file, clean_topolog);
-    save_csv(csv_file, clean_topolog);
+      // 3. Save File
+      stringstream ss_prefix;
+      ss_prefix << "outputs/run_" << setfill('0') << setw(3) << sim_count
+                << "_W" << int(wafer_rotation) << "_B" << int(brush_rotation);
+      string name_prefix = ss_prefix.str();
+      string csv_file = name_prefix + ".csv";
+
+      save_csv(csv_file, clean_topolog);
+      cout << "Saved: " << csv_file << endl << endl;
+    }
   }
+
   auto end_time = std::chrono::high_resolution_clock::now();
   std::chrono::duration<double> elapsed = end_time - start_time;
-  cout << "Total execution time: " << elapsed.count() << "second" << endl;
+  cout << "Total execution time: " << elapsed.count() << " seconds" << endl;
 
   return 0;
 }
