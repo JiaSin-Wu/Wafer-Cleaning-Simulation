@@ -245,11 +245,18 @@ __global__ void compute_sum_kernel(const int *data, int H, int W,
 
 __global__ void compute_variance_kernel(const int *data, int H, int W,
                                         double center_x, double center_y,
-                                        double radius_sq, double mean,
+                                        double radius_sq, double *d_mean,
                                         double *block_sq_devs,
                                         int *block_counts) {
   __shared__ double s_sq_dev[512];
   __shared__ int s_count[512];
+  __shared__ double shared_mean;
+
+  // Load mean into shared memory
+  if (threadIdx.x == 0) {
+    shared_mean = *d_mean;
+  }
+  __syncthreads();
 
   int tid = threadIdx.x;
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -267,7 +274,7 @@ __global__ void compute_variance_kernel(const int *data, int H, int W,
 
     if (dist_sq <= radius_sq) {
       double val = (double)data[idx];
-      double deviation = val - mean;
+      double deviation = val - shared_mean;
       my_sq_dev = deviation * deviation;
       my_count = 1;
     }
@@ -291,27 +298,91 @@ __global__ void compute_variance_kernel(const int *data, int H, int W,
   }
 }
 
-// CPU reduction helpers
-double reduce_blocks_cpu(double *h_block_data, int num_blocks) {
-  double total = 0.0;
-  for (int i = 0; i < num_blocks; i++)
-    total += h_block_data[i];
-  return total;
-}
-int reduce_blocks_cpu_int(int *h_block_data, int num_blocks) {
-  int total = 0;
-  for (int i = 0; i < num_blocks; i++)
-    total += h_block_data[i];
-  return total;
-}
-long long reduce_blocks_cpu_ll(long long *h_block_data, int num_blocks) {
-  long long total = 0;
-  for (int i = 0; i < num_blocks; i++)
-    total += h_block_data[i];
-  return total;
+// Custom atomicAdd for long long (for older CUDA versions/architectures)
+__device__ long long atomicAdd_ll(long long* address, long long val) {
+    unsigned long long int* address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+                        (unsigned long long int)((long long)assumed + val));
+    } while (assumed != old);
+    return (long long)old;
 }
 
-// RMS Host Function
+// GPU reduction kernels for final reduction
+__global__ void reduce_sum_ll_kernel(long long *data, long long *result, int n) {
+  extern __shared__ long long sdata_ll[];
+  
+  unsigned int tid = threadIdx.x;
+  unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+  
+  sdata_ll[tid] = (i < n) ? data[i] : 0;
+  __syncthreads();
+  
+  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      sdata_ll[tid] += sdata_ll[tid + s];
+    }
+    __syncthreads();
+  }
+  
+  if (tid == 0) atomicAdd_ll(result, sdata_ll[0]);
+}
+
+__global__ void reduce_sum_int_kernel(int *data, int *result, int n) {
+  extern __shared__ int sdata_int[];
+  
+  unsigned int tid = threadIdx.x;
+  unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+  
+  sdata_int[tid] = (i < n) ? data[i] : 0;
+  __syncthreads();
+  
+  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      sdata_int[tid] += sdata_int[tid + s];
+    }
+    __syncthreads();
+  }
+  
+  if (tid == 0) atomicAdd(result, sdata_int[0]);
+}
+
+__global__ void reduce_sum_double_kernel(double *data, double *result, int n) {
+  extern __shared__ double sdata_double[];
+  
+  unsigned int tid = threadIdx.x;
+  unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+  
+  sdata_double[tid] = (i < n) ? data[i] : 0.0;
+  __syncthreads();
+  
+  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      sdata_double[tid] += sdata_double[tid + s];
+    }
+    __syncthreads();
+  }
+  
+  if (tid == 0) atomicAdd(result, sdata_double[0]);
+}
+
+// Calculate mean on GPU
+__global__ void calculate_mean_kernel(long long *total_sum, int *total_count, double *mean) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    *mean = (double)(*total_sum) / (*total_count);
+  }
+}
+
+// Calculate RMS on GPU
+__global__ void calculate_rms_kernel(double *total_sq_dev, int *total_count, double *rms) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    *rms = sqrt((*total_sq_dev) / (*total_count));
+  }
+}
+
+// RMS Host Function - Fully optimized to minimize GPU-CPU transfers
 double calculate_rms_deviation_circle_gpu(int *d_data, int H, int W,
                                           double wafer_rad,
                                           double resolution_cm) {
@@ -327,6 +398,7 @@ double calculate_rms_deviation_circle_gpu(int *d_data, int H, int W,
   int threads_per_block = 512;
   int num_blocks = (total_pixels + threads_per_block - 1) / threads_per_block;
 
+  // Allocate memory for block results
   long long *d_block_sums;
   int *d_block_counts;
   double *d_block_sq_devs;
@@ -335,49 +407,88 @@ double calculate_rms_deviation_circle_gpu(int *d_data, int H, int W,
   cudaMalloc(&d_block_counts, num_blocks * sizeof(int));
   cudaMalloc(&d_block_sq_devs, num_blocks * sizeof(double));
 
-  vector<long long> h_block_sums(num_blocks);
-  vector<int> h_block_counts(num_blocks);
-  vector<double> h_block_sq_devs(num_blocks);
+  // Allocate memory for final results on GPU
+  long long *d_total_sum;
+  int *d_total_count;
+  double *d_total_sq_dev;
+  double *d_mean;
+  double *d_rms;
+
+  cudaMalloc(&d_total_sum, sizeof(long long));
+  cudaMalloc(&d_total_count, sizeof(int));
+  cudaMalloc(&d_total_sq_dev, sizeof(double));
+  cudaMalloc(&d_mean, sizeof(double));
+  cudaMalloc(&d_rms, sizeof(double));
+
+  // Initialize totals to zero
+  cudaMemset(d_total_sum, 0, sizeof(long long));
+  cudaMemset(d_total_count, 0, sizeof(int));
+  cudaMemset(d_total_sq_dev, 0, sizeof(double));
 
   // PASS 1: Sum and Count
   compute_sum_kernel<<<num_blocks, threads_per_block>>>(
       d_data, H, W, center_x, center_y, radius_sq, d_block_sums,
       d_block_counts);
+
+  // Reduce block sums and counts on GPU
+  int reduce_blocks = (num_blocks + threads_per_block - 1) / threads_per_block;
+  reduce_sum_ll_kernel<<<reduce_blocks, threads_per_block, threads_per_block * sizeof(long long)>>>(
+      d_block_sums, d_total_sum, num_blocks);
+  reduce_sum_int_kernel<<<reduce_blocks, threads_per_block, threads_per_block * sizeof(int)>>>(
+      d_block_counts, d_total_count, num_blocks);
+
   cudaDeviceSynchronize();
 
-  cudaMemcpy(h_block_sums.data(), d_block_sums, num_blocks * sizeof(long long),
-             cudaMemcpyDeviceToHost);
-  cudaMemcpy(h_block_counts.data(), d_block_counts, num_blocks * sizeof(int),
-             cudaMemcpyDeviceToHost);
-
-  long long total_sum = reduce_blocks_cpu_ll(h_block_sums.data(), num_blocks);
-  int total_count = reduce_blocks_cpu_int(h_block_counts.data(), num_blocks);
-
-  if (total_count == 0) {
+  // Calculate mean on GPU
+  calculate_mean_kernel<<<1, 1>>>(d_total_sum, d_total_count, d_mean);
+  cudaDeviceSynchronize();
+  // Check if count is zero (minimal GPU->CPU transfer)
+  int h_total_count;
+  cudaMemcpy(&h_total_count, d_total_count, sizeof(int), cudaMemcpyDeviceToHost);
+  
+  if (h_total_count == 0) {
     cudaFree(d_block_sums);
     cudaFree(d_block_counts);
     cudaFree(d_block_sq_devs);
+    cudaFree(d_total_sum);
+    cudaFree(d_total_count);
+    cudaFree(d_total_sq_dev);
+    cudaFree(d_mean);
+    cudaFree(d_rms);
     return 0.0;
   }
 
-  double mean = (double)total_sum / total_count;
-
-  // PASS 2: Variance
+  // PASS 2: Variance (now using d_mean directly on GPU)
   compute_variance_kernel<<<num_blocks, threads_per_block>>>(
-      d_data, H, W, center_x, center_y, radius_sq, mean, d_block_sq_devs,
+      d_data, H, W, center_x, center_y, radius_sq, d_mean, d_block_sq_devs,
       d_block_counts);
+  
+  cudaDeviceSynchronize(); 
+
+  // Reduce squared deviations on GPU
+  reduce_sum_double_kernel<<<reduce_blocks, threads_per_block, threads_per_block * sizeof(double)>>>(
+      d_block_sq_devs, d_total_sq_dev, num_blocks);
+
+  // Calculate RMS on GPU
+  calculate_rms_kernel<<<1, 1>>>(d_total_sq_dev, d_total_count, d_rms);
+  
   cudaDeviceSynchronize();
 
-  cudaMemcpy(h_block_sq_devs.data(), d_block_sq_devs,
-             num_blocks * sizeof(double), cudaMemcpyDeviceToHost);
+  // Only copy final RMS result to host
+  double h_rms;
+  cudaMemcpy(&h_rms, d_rms, sizeof(double), cudaMemcpyDeviceToHost);
 
-  double total_sq_dev = reduce_blocks_cpu(h_block_sq_devs.data(), num_blocks);
-
+  // Free memory
   cudaFree(d_block_sums);
   cudaFree(d_block_counts);
   cudaFree(d_block_sq_devs);
+  cudaFree(d_total_sum);
+  cudaFree(d_total_count);
+  cudaFree(d_total_sq_dev);
+  cudaFree(d_mean);
+  cudaFree(d_rms);
 
-  return sqrt(total_sq_dev / total_count);
+  return h_rms;
 }
 
 // ============================================================================
@@ -406,7 +517,7 @@ int main(int argc, char **argv) {
   double time_resolution = 0.001;
 
   cout << fixed << setprecision(4);
-  cout << "Running integrated pipeline (Enumeration 50 simulations)...\n";
+  cout << "Running integrated pipeline (Enumeration 100 simulations)...\n";
   cout << "Parameters: wafer_radius=" << Wafer_rad
        << "cm, resolution=" << wafer_resolution_cm << "cm\n\n";
 
@@ -459,14 +570,20 @@ int main(int argc, char **argv) {
            << " microseconds" << endl;
       cout << "RMS Deviation: " << rms_deviation << endl;
 
-      // STEP 3: Copy to CPU for CSV Saving
-      auto start_csv_prep = high_resolution_clock::now();
+      // ========================================================================
+      // STEP 3: CSV OUTPUT SECTION - Copy GPU data to CPU and save to CSV file
+      // ========================================================================
+      /*auto start_csv_prep = high_resolution_clock::now();
 
+      // Allocate a flat array on CPU to receive data from GPU
       vector<int> flat_wafer(gpu_wafer.H * gpu_wafer.W);
+      
+      // Copy the wafer data from GPU memory to CPU memory
       cudaMemcpy(flat_wafer.data(), gpu_wafer.d_data,
                  gpu_wafer.H * gpu_wafer.W * sizeof(int),
                  cudaMemcpyDeviceToHost);
 
+      // Convert the flat 1D array to a 2D vector for CSV output
       vector<vector<int>> wafer_2d(gpu_wafer.H, vector<int>(gpu_wafer.W));
       for (int j = 0; j < gpu_wafer.H; ++j) {
         for (int k = 0; k < gpu_wafer.W; ++k) {
@@ -475,16 +592,22 @@ int main(int argc, char **argv) {
       }
 
       auto end_csv_prep = high_resolution_clock::now();
-      // duration_cast<milliseconds>(end_csv_prep - start_csv_prep);
+      // Optionally measure CSV preparation time
+      // auto duration_csv_prep = duration_cast<milliseconds>(end_csv_prep - start_csv_prep);
 
-      // Save CSV with specific RPMs in filename
+      // Generate output filename with simulation parameters
       stringstream ss_prefix;
       ss_prefix << "outputs/run_" << setfill('0') << setw(3) << sim_count
                 << "_W" << int(wafer_rotation) << "_B" << int(brush_rotation);
 
       string csv_file = ss_prefix.str() + ".csv";
+      
+      // Save the 2D wafer data to CSV file
       save_csv(csv_file, wafer_2d);
-      cout << "Saved to: " << csv_file << endl;
+      cout << "Saved to: " << csv_file << endl;*/
+      // ========================================================================
+      // END OF CSV OUTPUT SECTION
+      // ========================================================================
 
       // STEP 4: Free GPU memory
       cudaFree(gpu_wafer.d_data);
